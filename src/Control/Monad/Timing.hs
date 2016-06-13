@@ -13,7 +13,7 @@ module Control.Monad.Timing
       MonadTiming(..), TimingTree, Tag,
 
       -- * @TimingT@, general timing handler
-      TimingT(..), runTimingT, execTimingT,
+      TimingT(..), execTimingT, timingAll,
 
       -- * @NoTimingT@, a no-timing handler
       NoTimingT (..)
@@ -46,31 +46,20 @@ type TimingTree = Tree (Tag, NominalDiffTime)
 type Tag = String
 
 -- | A monad transformer that records timing events.
---
--- Note that this module exports both '_runTimingT' and 'runTimingT'.
---
--- * '_runTimingT' returns the timing events verbatim without sanitization.
--- * 'runTimingT' combines trees with the same 'Tag' and tags the duration
--- of the entire computation with the special tag @\<all\>@.
-newtype TimingT m a = TimingT { _runTimingT :: m (a, [TimingTree]) }
+newtype TimingT m a = TimingT {
+    -- | Run the giving @TimingT@ computation, recording timing events.
+    runTimingT :: m (a, [TimingTree]) }
+
+-- | Wrap an entire @TimingT@ computation in a timing event.
+timingAll :: MonadIO m => TimingT m a -> m (a, TimingTree)
+timingAll = fmap (second head) . runTimingT . timeGroup "<all>"
 
 evalTimingT :: Functor f => TimingT f b -> f b
-evalTimingT = fmap fst . _runTimingT
+evalTimingT = fmap fst . runTimingT
 
 -- | Run a @TimingT@ computation, discarding the result.
-execTimingT :: MonadIO m => TimingT m b -> m TimingTree
+execTimingT :: MonadIO m => TimingT m b -> m [TimingTree]
 execTimingT = fmap snd . runTimingT
-
--- | Run the giving @TimingT@ computation, recording timing events.
-runTimingT :: MonadIO m => TimingT m a -> m (a, TimingTree)
-runTimingT = fmap (second (head . condenseTree)) . _runTimingT . timeGroup "<all>"
-
-condenseTree :: [TimingTree] -> [TimingTree]
-condenseTree = map (foldl collapseNodes emptyNode)
-             . groupBy ((==) `on` (fst . rootLabel)) where
-    collapseNodes (Node (_, x) sub) (Node (t, x1) sub2)
-        = Node (t, x + x1) (condenseTree $ sub ++ sub2)
-    emptyNode = Node ("", 0) []
 
 liftTimingT :: Functor m => m a -> TimingT m a
 liftTimingT = TimingT . fmap (\ x -> (x, []))
@@ -85,13 +74,19 @@ instance Applicative m => Applicative (TimingT m) where
 
 instance Alternative m => Alternative (TimingT m) where
     empty = liftTimingT empty
-    a <|> b = TimingT $ _runTimingT a <|> _runTimingT b
+    a <|> b = TimingT $ runTimingT a <|> runTimingT b
 
 instance Monad m => Monad (TimingT m) where
     TimingT a >>= f = TimingT $ do
         (thing1, b) <- a
-        (thing2, c) <- _runTimingT $ f thing1
-        return (thing2, b ++ c)
+        (thing2, c) <- runTimingT $ f thing1
+        return (thing2, condenseTree $ b ++ c)
+        where
+            condenseTree = map (foldl collapseNodes emptyNode)
+                         . groupBy ((==) `on` (fst . rootLabel)) where
+                collapseNodes (Node (_, x) sub) (Node (t, x1) sub2)
+                    = Node (t, x + x1) (condenseTree $ sub ++ sub2)
+                emptyNode = Node ("", 0) []
 
 instance MonadTrans TimingT where
     lift = liftTimingT
@@ -102,16 +97,16 @@ instance MonadFix m => MonadFix (TimingT m) where
 instance MonadPlus m => MonadPlus (TimingT m) where
 
 instance MonadReader r m => MonadReader r (TimingT m) where
-    local f m = TimingT $ local f $ _runTimingT m
+    local f m = TimingT $ local f $ runTimingT m
     ask = lift ask
 
 instance MonadWriter w m => MonadWriter w (TimingT m) where
     tell = lift . tell
     listen m = TimingT $ do
-        ~((a, b), c) <- listen (_runTimingT m)
+        ~((a, b), c) <- listen (runTimingT m)
         return ((a, c), b)
     pass m = TimingT $ pass $ do
-        ~((a, b), c) <- _runTimingT m
+        ~((a, b), c) <- runTimingT m
         return ((a, c), b)
 
 instance MonadState s m => MonadState s (TimingT m) where
@@ -127,17 +122,17 @@ instance MonadThrow m => MonadThrow (TimingT m) where
     throwM e = TimingT $ throwM e
 
 instance MonadCatch m => MonadCatch (TimingT m) where
-    TimingT a `catch` f = TimingT $ a `catch` (_runTimingT . f)
+    TimingT a `catch` f = TimingT $ a `catch` (runTimingT . f)
 
 instance MonadMask m => MonadMask (TimingT m) where
-    mask a = TimingT $ mask $ \ u -> _runTimingT (a $ q u) where
+    mask a = TimingT $ mask $ \ u -> runTimingT (a $ q u) where
         q u (TimingT m) = TimingT (u m)
-    uninterruptibleMask a = TimingT $ uninterruptibleMask $ \ u -> _runTimingT (a $ q u) where
+    uninterruptibleMask a = TimingT $ uninterruptibleMask $ \ u -> runTimingT (a $ q u) where
         q u (TimingT m) = TimingT (u m)
 
 instance MonadError e m => MonadError e (TimingT m) where
     throwError = TimingT . throwError
-    TimingT a `catchError` f = TimingT $ a `catchError` (_runTimingT . f)
+    TimingT a `catchError` f = TimingT $ a `catchError` (runTimingT . f)
 
 instance MonadBase b m => MonadBase b (TimingT m) where
     liftBase = lift . liftBase
